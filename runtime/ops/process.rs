@@ -61,6 +61,7 @@ fn subprocess_stdio_map(s: &str) -> Result<std::process::Stdio, AnyError> {
 pub struct RunArgs {
   cmd: Vec<String>,
   cwd: Option<String>,
+  clear_env: bool,
   env: Vec<(String, String)>,
   stdin: String,
   stdout: String,
@@ -113,6 +114,11 @@ fn op_run(
     c.arg(arg);
   });
   cwd.map(|d| c.current_dir(d));
+
+  if run_args.clear_env {
+    super::check_unstable(state, "Deno.run.clearEnv");
+    c.env_clear();
+  }
   for (key, value) in &env {
     c.env(key, value);
   }
@@ -206,8 +212,7 @@ async fn op_run_status(
   let resource = state
     .borrow_mut()
     .resource_table
-    .get::<ChildResource>(rid)
-    .ok_or_else(bad_resource_id)?;
+    .get::<ChildResource>(rid)?;
   let mut child = resource.borrow_mut().await;
   let run_status = child.wait().await?;
   let code = run_status.code();

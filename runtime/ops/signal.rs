@@ -1,14 +1,12 @@
 // Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
 use deno_core::error::AnyError;
-use deno_core::op_async;
+use deno_core::op_async_unref;
 use deno_core::op_sync;
 use deno_core::Extension;
 use deno_core::OpState;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-#[cfg(unix)]
-use deno_core::error::bad_resource_id;
 #[cfg(unix)]
 use deno_core::AsyncRefCell;
 #[cfg(unix)]
@@ -31,7 +29,7 @@ pub fn init() -> Extension {
     .ops(vec![
       ("op_signal_bind", op_sync(op_signal_bind)),
       ("op_signal_unbind", op_sync(op_signal_unbind)),
-      ("op_signal_poll", op_async(op_signal_poll)),
+      ("op_signal_poll", op_async_unref(op_signal_poll)),
     ])
     .build()
 }
@@ -81,8 +79,7 @@ async fn op_signal_poll(
   let resource = state
     .borrow_mut()
     .resource_table
-    .get::<SignalStreamResource>(rid)
-    .ok_or_else(bad_resource_id)?;
+    .get::<SignalStreamResource>(rid)?;
   let cancel = RcRef::map(&resource, |r| &r.cancel);
   let mut signal = RcRef::map(&resource, |r| &r.signal).borrow_mut().await;
 
@@ -99,10 +96,7 @@ pub fn op_signal_unbind(
   _: (),
 ) -> Result<(), AnyError> {
   super::check_unstable(state, "Deno.signal");
-  state
-    .resource_table
-    .close(rid)
-    .ok_or_else(bad_resource_id)?;
+  state.resource_table.close(rid)?;
   Ok(())
 }
 

@@ -5,6 +5,7 @@ use super::tsc;
 
 use crate::ast;
 use crate::import_map::ImportMap;
+use crate::lsp::documents::DocumentData;
 use crate::media_type::MediaType;
 use crate::module_graph::parse_deno_types;
 use crate::module_graph::parse_ts_reference;
@@ -17,6 +18,7 @@ use deno_core::error::AnyError;
 use deno_core::serde::Deserialize;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
+use deno_core::url;
 use deno_core::ModuleResolutionError;
 use deno_core::ModuleSpecifier;
 use deno_lint::rules;
@@ -27,7 +29,11 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::rc::Rc;
+use swc_common::DUMMY_SP;
+use swc_ecmascript::ast as swc_ast;
+use swc_ecmascript::visit::Node;
+use swc_ecmascript::visit::Visit;
+use swc_ecmascript::visit::VisitWith;
 
 lazy_static::lazy_static! {
   /// Diagnostic error codes which actually are the same, and so when grouping
@@ -178,9 +184,20 @@ impl ResolvedDependencyErr {
       Self::InvalidLocalImport => {
         lsp::NumberOrString::String("invalid-local-import".to_string())
       }
-      Self::InvalidSpecifier(_) => {
-        lsp::NumberOrString::String("invalid-specifier".to_string())
-      }
+      Self::InvalidSpecifier(error) => match error {
+        ModuleResolutionError::ImportPrefixMissing(_, _) => {
+          lsp::NumberOrString::String("import-prefix-missing".to_string())
+        }
+        ModuleResolutionError::InvalidBaseUrl(_) => {
+          lsp::NumberOrString::String("invalid-base-url".to_string())
+        }
+        ModuleResolutionError::InvalidPath(_) => {
+          lsp::NumberOrString::String("invalid-path".to_string())
+        }
+        ModuleResolutionError::InvalidUrl(_) => {
+          lsp::NumberOrString::String("invalid-url".to_string())
+        }
+      },
       Self::Missing => lsp::NumberOrString::String("missing".to_string()),
     }
   }
@@ -205,6 +222,23 @@ impl fmt::Display for ResolvedDependencyErr {
 pub enum ResolvedDependency {
   Resolved(ModuleSpecifier),
   Err(ResolvedDependencyErr),
+}
+
+impl ResolvedDependency {
+  pub fn as_hover_text(&self) -> String {
+    match self {
+      Self::Resolved(specifier) => match specifier.scheme() {
+        "data" => "_(a data url)_".to_string(),
+        "blob" => "_(a blob url)_".to_string(),
+        _ => format!(
+          "{}&#8203;{}",
+          specifier[..url::Position::AfterScheme].to_string(),
+          specifier[url::Position::AfterScheme..].to_string()
+        ),
+      },
+      Self::Err(_) => "_[errored]_".to_string(),
+    }
+  }
 }
 
 pub fn resolve_import(
@@ -250,13 +284,7 @@ pub fn parse_module(
   source: &str,
   media_type: &MediaType,
 ) -> Result<ast::ParsedModule, AnyError> {
-  let source_map = Rc::new(swc_common::SourceMap::default());
-  ast::parse_with_source_map(
-    &specifier.to_string(),
-    source,
-    &media_type,
-    source_map,
-  )
+  ast::parse(&specifier.to_string(), source, media_type)
 }
 
 // TODO(@kitsonk) a lot of this logic is duplicated in module_graph.rs in
@@ -272,8 +300,8 @@ pub fn analyze_dependencies(
 
   // Parse leading comments for supported triple slash references.
   for comment in parsed_module.get_leading_comments().iter() {
-    if let Some((ts_reference, span)) = parse_ts_reference(&comment) {
-      let loc = parsed_module.source_map.lookup_char_pos(span.lo);
+    if let Some((ts_reference, span)) = parse_ts_reference(comment) {
+      let loc = parsed_module.get_location(span.lo);
       match ts_reference {
         TypeScriptReference::Path(import) => {
           let dep = dependencies.entry(import.clone()).or_default();
@@ -283,11 +311,11 @@ pub fn analyze_dependencies(
           dep.maybe_code_specifier_range = Some(Range {
             start: Position {
               line: (loc.line - 1) as u32,
-              character: loc.col_display as u32,
+              character: loc.col as u32,
             },
             end: Position {
               line: (loc.line - 1) as u32,
-              character: (loc.col_display + import.chars().count() + 2) as u32,
+              character: (loc.col + import.chars().count() + 2) as u32,
             },
           });
         }
@@ -304,11 +332,11 @@ pub fn analyze_dependencies(
           dep.maybe_type_specifier_range = Some(Range {
             start: Position {
               line: (loc.line - 1) as u32,
-              character: loc.col_display as u32,
+              character: loc.col as u32,
             },
             end: Position {
               line: (loc.line - 1) as u32,
-              character: (loc.col_display + import.chars().count() + 2) as u32,
+              character: (loc.col + import.chars().count() + 2) as u32,
             },
           });
         }
@@ -327,11 +355,11 @@ pub fn analyze_dependencies(
     let maybe_resolved_type_dependency =
       // Check for `@deno-types` pragmas that affect the import
       if let Some(comment) = desc.leading_comments.last() {
-        parse_deno_types(&comment).as_ref().map(|(deno_types, span)| {
+        parse_deno_types(comment).as_ref().map(|(deno_types, span)| {
           (
             resolve_import(deno_types, specifier, maybe_import_map),
             deno_types.clone(),
-            parsed_module.source_map.lookup_char_pos(span.lo)
+            parsed_module.get_location(span.lo)
           )
         })
       } else {
@@ -340,37 +368,20 @@ pub fn analyze_dependencies(
 
     let dep = dependencies.entry(desc.specifier.to_string()).or_default();
     dep.is_dynamic = desc.is_dynamic;
-    match desc.kind {
-      swc_ecmascript::dep_graph::DependencyKind::ExportType
-      | swc_ecmascript::dep_graph::DependencyKind::ImportType => {
-        dep.maybe_type_specifier_range = Some(Range {
-          start: Position {
-            line: (desc.specifier_line - 1) as u32,
-            character: desc.specifier_col as u32,
-          },
-          end: Position {
-            line: (desc.specifier_line - 1) as u32,
-            character: (desc.specifier_col + desc.specifier.chars().count() + 2)
-              as u32,
-          },
-        });
-        dep.maybe_type = Some(resolved_import)
-      }
-      _ => {
-        dep.maybe_code_specifier_range = Some(Range {
-          start: Position {
-            line: (desc.specifier_line - 1) as u32,
-            character: desc.specifier_col as u32,
-          },
-          end: Position {
-            line: (desc.specifier_line - 1) as u32,
-            character: (desc.specifier_col + desc.specifier.chars().count() + 2)
-              as u32,
-          },
-        });
-        dep.maybe_code = Some(resolved_import);
-      }
-    }
+    let start = parsed_module.get_location(desc.specifier_span.lo);
+    let end = parsed_module.get_location(desc.specifier_span.hi);
+    let range = Range {
+      start: Position {
+        line: (start.line - 1) as u32,
+        character: start.col as u32,
+      },
+      end: Position {
+        line: (end.line - 1) as u32,
+        character: end.col as u32,
+      },
+    };
+    dep.maybe_code_specifier_range = Some(range);
+    dep.maybe_code = Some(resolved_import);
     if dep.maybe_type.is_none() {
       if let Some((resolved_dependency, specifier, loc)) =
         maybe_resolved_type_dependency
@@ -378,11 +389,11 @@ pub fn analyze_dependencies(
         dep.maybe_type_specifier_range = Some(Range {
           start: Position {
             line: (loc.line - 1) as u32,
-            character: (loc.col_display + 1) as u32,
+            character: (loc.col + 1) as u32,
           },
           end: Position {
             line: (loc.line - 1) as u32,
-            character: (loc.col_display + 1 + specifier.chars().count()) as u32,
+            character: (loc.col + 1 + specifier.chars().count()) as u32,
           },
         });
         dep.maybe_type = Some(resolved_dependency);
@@ -619,6 +630,7 @@ pub struct DenoFixData {
 #[derive(Debug, Clone)]
 enum CodeActionKind {
   Deno(lsp::CodeAction),
+  DenoLint(lsp::CodeAction),
   Tsc(lsp::CodeAction, tsc::CodeFixAction),
 }
 
@@ -662,6 +674,106 @@ impl CodeActionCollection {
       };
       self.actions.push(CodeActionKind::Deno(code_action));
     }
+    Ok(())
+  }
+
+  pub(crate) fn add_deno_lint_ignore_action(
+    &mut self,
+    specifier: &ModuleSpecifier,
+    document: Option<&DocumentData>,
+    diagnostic: &lsp::Diagnostic,
+  ) -> Result<(), AnyError> {
+    let code = diagnostic
+      .code
+      .as_ref()
+      .map(|v| match v {
+        lsp::NumberOrString::String(v) => v.to_owned(),
+        _ => "".to_string(),
+      })
+      .unwrap();
+
+    let line_content = if let Some(doc) = document {
+      doc
+        .content_line(diagnostic.range.start.line as usize)
+        .ok()
+        .flatten()
+    } else {
+      None
+    };
+
+    let mut changes = HashMap::new();
+    changes.insert(
+      specifier.clone(),
+      vec![lsp::TextEdit {
+        new_text: prepend_whitespace(
+          format!("// deno-lint-ignore {}\n", code),
+          line_content,
+        ),
+        range: lsp::Range {
+          start: lsp::Position {
+            line: diagnostic.range.start.line,
+            character: 0,
+          },
+          end: lsp::Position {
+            line: diagnostic.range.start.line,
+            character: 0,
+          },
+        },
+      }],
+    );
+    let ignore_error_action = lsp::CodeAction {
+      title: format!("Disable {} for this line", code),
+      kind: Some(lsp::CodeActionKind::QUICKFIX),
+      diagnostics: Some(vec![diagnostic.clone()]),
+      command: None,
+      is_preferred: None,
+      disabled: None,
+      data: None,
+      edit: Some(lsp::WorkspaceEdit {
+        changes: Some(changes),
+        change_annotations: None,
+        document_changes: None,
+      }),
+    };
+    self
+      .actions
+      .push(CodeActionKind::DenoLint(ignore_error_action));
+
+    let mut changes = HashMap::new();
+    changes.insert(
+      specifier.clone(),
+      vec![lsp::TextEdit {
+        new_text: "// deno-lint-ignore-file\n".to_string(),
+        range: lsp::Range {
+          start: lsp::Position {
+            line: 0,
+            character: 0,
+          },
+          end: lsp::Position {
+            line: 0,
+            character: 0,
+          },
+        },
+      }],
+    );
+    let ignore_file_action = lsp::CodeAction {
+      title: "Ignore lint errors for the entire file".to_string(),
+      kind: Some(lsp::CodeActionKind::QUICKFIX),
+      diagnostics: Some(vec![diagnostic.clone()]),
+      command: None,
+      is_preferred: None,
+      disabled: None,
+      data: None,
+      edit: Some(lsp::WorkspaceEdit {
+        changes: Some(changes),
+        change_annotations: None,
+        document_changes: None,
+      }),
+    };
+    self
+      .actions
+      .push(CodeActionKind::DenoLint(ignore_file_action));
+
     Ok(())
   }
 
@@ -779,6 +891,7 @@ impl CodeActionCollection {
       .map(|i| match i {
         CodeActionKind::Tsc(c, _) => lsp::CodeActionOrCommand::CodeAction(c),
         CodeActionKind::Deno(c) => lsp::CodeActionOrCommand::CodeAction(c),
+        CodeActionKind::DenoLint(c) => lsp::CodeActionOrCommand::CodeAction(c),
       })
       .collect()
   }
@@ -831,6 +944,165 @@ impl CodeActionCollection {
       }
     }
   }
+}
+
+/// Prepend the whitespace characters found at the start of line_content to content.
+fn prepend_whitespace(content: String, line_content: Option<String>) -> String {
+  if let Some(line) = line_content {
+    let whitespaces =
+      line.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
+    let whitespace = &line[0..whitespaces];
+    format!("{}{}", &whitespace, content)
+  } else {
+    content
+  }
+}
+
+/// Get LSP range from the provided start and end locations.
+fn get_range_from_location(
+  start: &ast::Location,
+  end: &ast::Location,
+) -> lsp::Range {
+  lsp::Range {
+    start: lsp::Position {
+      line: (start.line - 1) as u32,
+      character: start.col as u32,
+    },
+    end: lsp::Position {
+      line: (end.line - 1) as u32,
+      character: end.col as u32,
+    },
+  }
+}
+
+/// Narrow the range to only include the text of the specifier, excluding the
+/// quotes.
+fn narrow_range(range: lsp::Range) -> lsp::Range {
+  lsp::Range {
+    start: lsp::Position {
+      line: range.start.line,
+      character: range.start.character + 1,
+    },
+    end: lsp::Position {
+      line: range.end.line,
+      character: range.end.character - 1,
+    },
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyRange {
+  /// The LSP Range is inclusive of the quotes around the specifier.
+  pub range: lsp::Range,
+  /// The text of the specifier within the document.
+  pub specifier: String,
+}
+
+impl DependencyRange {
+  /// Determine if the position is within the range
+  fn within(&self, position: &lsp::Position) -> bool {
+    (position.line > self.range.start.line
+      || position.line == self.range.start.line
+        && position.character >= self.range.start.character)
+      && (position.line < self.range.end.line
+        || position.line == self.range.end.line
+          && position.character <= self.range.end.character)
+  }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DependencyRanges(Vec<DependencyRange>);
+
+impl DependencyRanges {
+  pub fn contains(&self, position: &lsp::Position) -> Option<DependencyRange> {
+    self.0.iter().find(|r| r.within(position)).cloned()
+  }
+}
+
+struct DependencyRangeCollector<'a> {
+  import_ranges: DependencyRanges,
+  parsed_module: &'a ast::ParsedModule,
+}
+
+impl<'a> DependencyRangeCollector<'a> {
+  pub fn new(parsed_module: &'a ast::ParsedModule) -> Self {
+    Self {
+      import_ranges: DependencyRanges::default(),
+      parsed_module,
+    }
+  }
+
+  pub fn take(self) -> DependencyRanges {
+    self.import_ranges
+  }
+}
+
+impl<'a> Visit for DependencyRangeCollector<'a> {
+  fn visit_import_decl(
+    &mut self,
+    node: &swc_ast::ImportDecl,
+    _parent: &dyn Node,
+  ) {
+    let start = self.parsed_module.get_location(node.src.span.lo);
+    let end = self.parsed_module.get_location(node.src.span.hi);
+    self.import_ranges.0.push(DependencyRange {
+      range: narrow_range(get_range_from_location(&start, &end)),
+      specifier: node.src.value.to_string(),
+    });
+  }
+
+  fn visit_named_export(
+    &mut self,
+    node: &swc_ast::NamedExport,
+    _parent: &dyn Node,
+  ) {
+    if let Some(src) = &node.src {
+      let start = self.parsed_module.get_location(src.span.lo);
+      let end = self.parsed_module.get_location(src.span.hi);
+      self.import_ranges.0.push(DependencyRange {
+        range: narrow_range(get_range_from_location(&start, &end)),
+        specifier: src.value.to_string(),
+      });
+    }
+  }
+
+  fn visit_export_all(
+    &mut self,
+    node: &swc_ast::ExportAll,
+    _parent: &dyn Node,
+  ) {
+    let start = self.parsed_module.get_location(node.src.span.lo);
+    let end = self.parsed_module.get_location(node.src.span.hi);
+    self.import_ranges.0.push(DependencyRange {
+      range: narrow_range(get_range_from_location(&start, &end)),
+      specifier: node.src.value.to_string(),
+    });
+  }
+
+  fn visit_ts_import_type(
+    &mut self,
+    node: &swc_ast::TsImportType,
+    _parent: &dyn Node,
+  ) {
+    let start = self.parsed_module.get_location(node.arg.span.lo);
+    let end = self.parsed_module.get_location(node.arg.span.hi);
+    self.import_ranges.0.push(DependencyRange {
+      range: narrow_range(get_range_from_location(&start, &end)),
+      specifier: node.arg.value.to_string(),
+    });
+  }
+}
+
+/// Analyze a document for import ranges, which then can be used to identify if
+/// a particular position within the document as inside an import range.
+pub fn analyze_dependency_ranges(
+  parsed_module: &ast::ParsedModule,
+) -> Result<DependencyRanges, AnyError> {
+  let mut collector = DependencyRangeCollector::new(parsed_module);
+  parsed_module
+    .module
+    .visit_with(&swc_ast::Invalid { span: DUMMY_SP }, &mut collector);
+  Ok(collector.take())
 }
 
 #[cfg(test)]
@@ -968,8 +1240,11 @@ mod tests {
       Status,
     } from "https://deno.land/x/oak@v6.3.2/mod.ts";
 
+    import type { Component } from "https://esm.sh/preact";
+    import { h, Fragment } from "https://esm.sh/preact";
+
     // @deno-types="https://deno.land/x/types/react/index.d.ts";
-    import * as React from "https://cdn.skypack.dev/react";
+    import React from "https://cdn.skypack.dev/react";
     "#;
     let parsed_module =
       parse_module(&specifier, source, &MediaType::TypeScript).unwrap();
@@ -980,7 +1255,7 @@ mod tests {
       &None,
     );
     assert!(maybe_type.is_none());
-    assert_eq!(actual.len(), 2);
+    assert_eq!(actual.len(), 3);
     assert_eq!(
       actual.get("https://cdn.skypack.dev/react").cloned(),
       Some(Dependency {
@@ -993,21 +1268,21 @@ mod tests {
         )),
         maybe_code_specifier_range: Some(Range {
           start: Position {
-            line: 8,
-            character: 27,
+            line: 11,
+            character: 22,
           },
           end: Position {
-            line: 8,
-            character: 58,
+            line: 11,
+            character: 53,
           }
         }),
         maybe_type_specifier_range: Some(Range {
           start: Position {
-            line: 7,
+            line: 10,
             character: 20,
           },
           end: Position {
-            line: 7,
+            line: 10,
             character: 62,
           }
         })
@@ -1032,6 +1307,84 @@ mod tests {
           }
         }),
         maybe_type_specifier_range: None,
+      })
+    );
+    assert_eq!(
+      actual.get("https://esm.sh/preact").cloned(),
+      Some(Dependency {
+        is_dynamic: false,
+        maybe_code: Some(ResolvedDependency::Resolved(
+          resolve_url("https://esm.sh/preact").unwrap()
+        )),
+        maybe_type: None,
+        maybe_code_specifier_range: Some(Range {
+          start: Position {
+            line: 8,
+            character: 32
+          },
+          end: Position {
+            line: 8,
+            character: 55
+          }
+        }),
+        maybe_type_specifier_range: None,
+      }),
+    );
+  }
+
+  #[test]
+  fn test_analyze_dependency_ranges() {
+    let specifier = resolve_url("file:///a.ts").unwrap();
+    let source =
+      "import * as a from \"./b.ts\";\nexport * as a from \"./c.ts\";\n";
+    let media_type = MediaType::TypeScript;
+    let parsed_module = parse_module(&specifier, source, &media_type).unwrap();
+    let result = analyze_dependency_ranges(&parsed_module);
+    assert!(result.is_ok());
+    let actual = result.unwrap();
+    assert_eq!(
+      actual.contains(&lsp::Position {
+        line: 0,
+        character: 0,
+      }),
+      None
+    );
+    assert_eq!(
+      actual.contains(&lsp::Position {
+        line: 0,
+        character: 22,
+      }),
+      Some(DependencyRange {
+        range: lsp::Range {
+          start: lsp::Position {
+            line: 0,
+            character: 20,
+          },
+          end: lsp::Position {
+            line: 0,
+            character: 26,
+          },
+        },
+        specifier: "./b.ts".to_string(),
+      })
+    );
+    assert_eq!(
+      actual.contains(&lsp::Position {
+        line: 1,
+        character: 22,
+      }),
+      Some(DependencyRange {
+        range: lsp::Range {
+          start: lsp::Position {
+            line: 1,
+            character: 20,
+          },
+          end: lsp::Position {
+            line: 1,
+            character: 26,
+          },
+        },
+        specifier: "./c.ts".to_string(),
       })
     );
   }

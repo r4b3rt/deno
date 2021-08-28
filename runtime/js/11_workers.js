@@ -3,10 +3,22 @@
 
 ((window) => {
   const core = window.Deno.core;
+  const {
+    ArrayIsArray,
+    ArrayPrototypeMap,
+    Error,
+    StringPrototypeStartsWith,
+    String,
+    SymbolIterator,
+  } = window.__bootstrap.primordials;
+  const webidl = window.__bootstrap.webidl;
+  const { URL } = window.__bootstrap.url;
   const { Window } = window.__bootstrap.globalInterfaces;
   const { getLocationHref } = window.__bootstrap.location;
   const { log, pathFromURL } = window.__bootstrap.util;
   const { defineEventHandler } = window.__bootstrap.webUtil;
+  const { deserializeJsMessageData, serializeJsMessageData } =
+    window.__bootstrap.messagePort;
 
   function createWorker(
     specifier,
@@ -15,6 +27,7 @@
     useDenoNamespace,
     permissions,
     name,
+    workerType,
   ) {
     return core.opSync("op_create_worker", {
       hasSourceCode,
@@ -23,6 +36,7 @@
       sourceCode,
       specifier,
       useDenoNamespace,
+      workerType,
     });
   }
 
@@ -34,8 +48,12 @@
     core.opSync("op_host_post_message", id, data);
   }
 
-  function hostGetMessage(id) {
-    return core.opAsync("op_host_get_message", id);
+  function hostRecvCtrl(id) {
+    return core.opAsync("op_host_recv_ctrl", id);
+  }
+
+  function hostRecvMessage(id) {
+    return core.opAsync("op_host_recv_message", id);
   }
 
   /**
@@ -68,15 +86,25 @@
           `Expected 'array' or 'boolean' for ${permission} permission, "${value}" received`,
         );
       }
-    } else if (!Array.isArray(value) && typeof value !== "boolean") {
+    } else if (!ArrayIsArray(value) && typeof value !== "boolean") {
       throw new Error(
         `Expected 'array' or 'boolean' for ${permission} permission, ${typeof value} received`,
       );
       //Casts URLs to absolute routes
-    } else if (Array.isArray(value)) {
-      value = value.map((route) => {
+    } else if (ArrayIsArray(value)) {
+      value = ArrayPrototypeMap(value, (route) => {
         if (route instanceof URL) {
-          route = pathFromURL(route);
+          if (permission === "net") {
+            throw new Error(
+              `Expected 'string' for net permission, received 'URL'`,
+            );
+          } else if (permission === "env") {
+            throw new Error(
+              `Expected 'string' for env permission, received 'URL'`,
+            );
+          } else {
+            route = pathFromURL(route);
+          }
         }
         return route;
       });
@@ -92,7 +120,7 @@
     env = "inherit",
     hrtime = "inherit",
     net = "inherit",
-    plugin = "inherit",
+    ffi = "inherit",
     read = "inherit",
     run = "inherit",
     write = "inherit",
@@ -101,7 +129,7 @@
       env: parseUnitPermission(env, "env"),
       hrtime: parseUnitPermission(hrtime, "hrtime"),
       net: parseArrayPermission(net, "net"),
-      plugin: parseUnitPermission(plugin, "plugin"),
+      ffi: parseUnitPermission(ffi, "ffi"),
       read: parseArrayPermission(read, "read"),
       run: parseUnitPermission(run, "run"),
       write: parseArrayPermission(write, "write"),
@@ -148,7 +176,7 @@
             env: false,
             hrtime: false,
             net: false,
-            plugin: false,
+            ffi: false,
             read: false,
             run: false,
             write: false,
@@ -156,24 +184,27 @@
         }
       }
 
-      if (type !== "module") {
-        throw new Error(
-          'Not yet implemented: only "module" type workers are supported',
-        );
-      }
-
-      this.#name = name;
-      const hasSourceCode = false;
-      const sourceCode = core.decode(new Uint8Array());
+      const workerType = webidl.converters["WorkerType"](type);
 
       if (
-        specifier.startsWith("./") || specifier.startsWith("../") ||
-        specifier.startsWith("/") || type == "classic"
+        StringPrototypeStartsWith(specifier, "./") ||
+        StringPrototypeStartsWith(specifier, "../") ||
+        StringPrototypeStartsWith(specifier, "/") || workerType === "classic"
       ) {
         const baseUrl = getLocationHref();
         if (baseUrl != null) {
           specifier = new URL(specifier, baseUrl).href;
         }
+      }
+
+      this.#name = name;
+      let hasSourceCode, sourceCode;
+      if (workerType === "classic") {
+        hasSourceCode = true;
+        sourceCode = `importScripts("#");`;
+      } else {
+        hasSourceCode = false;
+        sourceCode = "";
       }
 
       const id = createWorker(
@@ -185,20 +216,12 @@
           ? null
           : parsePermissions(workerDenoAttributes.permissions),
         options?.name,
+        workerType,
       );
       this.#id = id;
-      this.#poll();
+      this.#pollControl();
+      this.#pollMessages();
     }
-
-    #handleMessage(data) {
-      const msgEvent = new MessageEvent("message", {
-        cancelable: false,
-        data,
-      });
-
-      this.dispatchEvent(msgEvent);
-    }
-
     #handleError(e) {
       const event = new ErrorEvent("error", {
         cancelable: true,
@@ -219,9 +242,9 @@
       return handled;
     }
 
-    #poll = async () => {
+    #pollControl = async () => {
       while (!this.#terminated) {
-        const [type, data] = await hostGetMessage(this.#id);
+        const [type, data] = await hostRecvCtrl(this.#id);
 
         // If terminate was called then we ignore all messages
         if (this.#terminated) {
@@ -229,11 +252,6 @@
         }
 
         switch (type) {
-          case 0: { // Message
-            const msg = core.deserialize(data);
-            this.#handleMessage(msg);
-            break;
-          }
           case 1: { // TerminalError
             this.#terminated = true;
           } /* falls through */
@@ -262,19 +280,60 @@
       }
     };
 
-    postMessage(message, transferOrOptions) {
-      if (transferOrOptions) {
-        throw new Error(
-          "Not yet implemented: `transfer` and `options` are not supported.",
+    #pollMessages = async () => {
+      while (!this.terminated) {
+        const data = await hostRecvMessage(this.#id);
+        if (data === null) break;
+        let message, transferables;
+        try {
+          const v = deserializeJsMessageData(data);
+          message = v[0];
+          transferables = v[1];
+        } catch (err) {
+          const event = new MessageEvent("messageerror", {
+            cancelable: false,
+            data: err,
+          });
+          this.dispatchEvent(event);
+          return;
+        }
+        const event = new MessageEvent("message", {
+          cancelable: false,
+          data: message,
+          ports: transferables.filter((t) => t instanceof MessagePort),
+        });
+        this.dispatchEvent(event);
+      }
+    };
+
+    postMessage(message, transferOrOptions = {}) {
+      const prefix = "Failed to execute 'postMessage' on 'MessagePort'";
+      webidl.requiredArguments(arguments.length, 1, { prefix });
+      message = webidl.converters.any(message);
+      let options;
+      if (
+        webidl.type(transferOrOptions) === "Object" &&
+        transferOrOptions !== undefined &&
+        transferOrOptions[SymbolIterator] !== undefined
+      ) {
+        const transfer = webidl.converters["sequence<object>"](
+          transferOrOptions,
+          { prefix, context: "Argument 2" },
+        );
+        options = { transfer };
+      } else {
+        options = webidl.converters.StructuredSerializeOptions(
+          transferOrOptions,
+          {
+            prefix,
+            context: "Argument 2",
+          },
         );
       }
-
-      if (this.#terminated) {
-        return;
-      }
-
-      const bufferMsg = core.serialize(message);
-      hostPostMessage(this.#id, bufferMsg);
+      const { transfer } = options;
+      const data = serializeJsMessageData(message, transfer);
+      if (this.#terminated) return;
+      hostPostMessage(this.#id, data);
     }
 
     terminate() {
@@ -288,6 +347,11 @@
   defineEventHandler(Worker.prototype, "error");
   defineEventHandler(Worker.prototype, "message");
   defineEventHandler(Worker.prototype, "messageerror");
+
+  webidl.converters["WorkerType"] = webidl.createEnumConverter("WorkerType", [
+    "classic",
+    "module",
+  ]);
 
   window.__bootstrap.worker = {
     parsePermissions,

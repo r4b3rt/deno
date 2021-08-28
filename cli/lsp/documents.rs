@@ -6,12 +6,11 @@ use super::tsc;
 
 use crate::media_type::MediaType;
 
-use deno_core::error::anyhow;
 use deno_core::error::custom_error;
 use deno_core::error::AnyError;
 use deno_core::error::Context;
 use deno_core::ModuleSpecifier;
-use lspower::lsp::TextDocumentContentChangeEvent;
+use lspower::lsp;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -28,21 +27,39 @@ pub enum LanguageId {
   Json,
   JsonC,
   Markdown,
+  Unknown,
 }
 
 impl FromStr for LanguageId {
   type Err = AnyError;
 
-  fn from_str(s: &str) -> Result<Self, AnyError> {
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
     match s {
       "javascript" => Ok(Self::JavaScript),
       "javascriptreact" => Ok(Self::Jsx),
+      "jsx" => Ok(Self::Jsx),
       "typescript" => Ok(Self::TypeScript),
       "typescriptreact" => Ok(Self::Tsx),
+      "tsx" => Ok(Self::Tsx),
       "json" => Ok(Self::Json),
       "jsonc" => Ok(Self::JsonC),
       "markdown" => Ok(Self::Markdown),
-      _ => Err(anyhow!("Unsupported language id: {}", s)),
+      _ => Ok(Self::Unknown),
+    }
+  }
+}
+
+impl<'a> From<&'a LanguageId> for MediaType {
+  fn from(id: &'a LanguageId) -> MediaType {
+    match id {
+      LanguageId::JavaScript => MediaType::JavaScript,
+      LanguageId::Json => MediaType::Json,
+      LanguageId::JsonC => MediaType::Json,
+      LanguageId::Jsx => MediaType::Jsx,
+      LanguageId::Markdown => MediaType::Unknown,
+      LanguageId::Tsx => MediaType::Tsx,
+      LanguageId::TypeScript => MediaType::TypeScript,
+      LanguageId::Unknown => MediaType::Unknown,
     }
   }
 }
@@ -65,11 +82,12 @@ impl IndexValid {
 #[derive(Debug, Clone)]
 pub struct DocumentData {
   bytes: Option<Vec<u8>>,
-  language_id: LanguageId,
+  dependencies: Option<HashMap<String, analysis::Dependency>>,
+  dependency_ranges: Option<analysis::DependencyRanges>,
+  pub(crate) language_id: LanguageId,
   line_index: Option<LineIndex>,
   maybe_navigation_tree: Option<tsc::NavigationTree>,
   specifier: ModuleSpecifier,
-  dependencies: Option<HashMap<String, analysis::Dependency>>,
   version: Option<i32>,
 }
 
@@ -82,18 +100,19 @@ impl DocumentData {
   ) -> Self {
     Self {
       bytes: Some(source.as_bytes().to_owned()),
+      dependencies: None,
+      dependency_ranges: None,
       language_id,
       line_index: Some(LineIndex::new(source)),
       maybe_navigation_tree: None,
       specifier,
-      dependencies: None,
       version: Some(version),
     }
   }
 
   pub fn apply_content_changes(
     &mut self,
-    content_changes: Vec<TextDocumentContentChangeEvent>,
+    content_changes: Vec<lsp::TextDocumentContentChangeEvent>,
   ) -> Result<(), AnyError> {
     if self.bytes.is_none() {
       return Ok(());
@@ -103,13 +122,13 @@ impl DocumentData {
     let mut line_index = if let Some(line_index) = &self.line_index {
       line_index.clone()
     } else {
-      LineIndex::new(&content)
+      LineIndex::new(content)
     };
     let mut index_valid = IndexValid::All;
     for change in content_changes {
       if let Some(range) = change.range {
         if !index_valid.covers(range.start.line) {
-          line_index = LineIndex::new(&content);
+          line_index = LineIndex::new(content);
         }
         index_valid = IndexValid::UpTo(range.start.line);
         let range = line_index.get_text_range(range)?;
@@ -123,7 +142,7 @@ impl DocumentData {
     self.line_index = if index_valid == IndexValid::All {
       Some(line_index)
     } else {
-      Some(LineIndex::new(&content))
+      Some(LineIndex::new(content))
     };
     self.maybe_navigation_tree = None;
     Ok(())
@@ -139,12 +158,32 @@ impl DocumentData {
       Ok(None)
     }
   }
+
+  pub fn content_line(&self, line: usize) -> Result<Option<String>, AnyError> {
+    let content = self.content().ok().flatten();
+    if let Some(content) = content {
+      let lines = content.lines().into_iter().collect::<Vec<&str>>();
+      Ok(Some(lines[line].to_string()))
+    } else {
+      Ok(None)
+    }
+  }
+
+  /// Determines if a position within the document is within a dependency range
+  /// and if so, returns the range with the text of the specifier.
+  fn is_specifier_position(
+    &self,
+    position: &lsp::Position,
+  ) -> Option<analysis::DependencyRange> {
+    let import_ranges = self.dependency_ranges.as_ref()?;
+    import_ranges.contains(position)
+  }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DocumentCache {
   dependents_graph: HashMap<ModuleSpecifier, HashSet<ModuleSpecifier>>,
-  docs: HashMap<ModuleSpecifier, DocumentData>,
+  pub(crate) docs: HashMap<ModuleSpecifier, DocumentData>,
 }
 
 impl DocumentCache {
@@ -183,7 +222,7 @@ impl DocumentCache {
     &mut self,
     specifier: &ModuleSpecifier,
     version: i32,
-    content_changes: Vec<TextDocumentContentChangeEvent>,
+    content_changes: Vec<lsp::TextDocumentContentChangeEvent>,
   ) -> Result<Option<String>, AnyError> {
     if !self.contains_key(specifier) {
       return Err(custom_error(
@@ -236,16 +275,29 @@ impl DocumentCache {
     &self,
     specifier: &ModuleSpecifier,
   ) -> Option<HashMap<String, analysis::Dependency>> {
-    let doc = self.docs.get(specifier)?;
-    doc.dependencies.clone()
+    self
+      .docs
+      .get(specifier)
+      .map(|doc| doc.dependencies.clone())
+      .flatten()
+  }
+
+  pub fn get_language_id(
+    &self,
+    specifier: &ModuleSpecifier,
+  ) -> Option<LanguageId> {
+    self.docs.get(specifier).map(|doc| doc.language_id.clone())
   }
 
   pub fn get_navigation_tree(
     &self,
     specifier: &ModuleSpecifier,
   ) -> Option<tsc::NavigationTree> {
-    let doc = self.docs.get(specifier)?;
-    doc.maybe_navigation_tree.clone()
+    self
+      .docs
+      .get(specifier)
+      .map(|doc| doc.maybe_navigation_tree.clone())
+      .flatten()
   }
 
   /// Determines if the specifier should be processed for diagnostics and other
@@ -279,6 +331,17 @@ impl DocumentCache {
   /// Determines if the specifier can be processed for formatting.
   pub fn is_formattable(&self, specifier: &ModuleSpecifier) -> bool {
     self.docs.contains_key(specifier)
+  }
+
+  /// Determines if the position in the document is within a range of a module
+  /// specifier, returning the text range if true.
+  pub fn is_specifier_position(
+    &self,
+    specifier: &ModuleSpecifier,
+    position: &lsp::Position,
+  ) -> Option<analysis::DependencyRange> {
+    let document = self.docs.get(specifier)?;
+    document.is_specifier_position(position)
   }
 
   pub fn len(&self) -> usize {
@@ -336,9 +399,11 @@ impl DocumentCache {
     &mut self,
     specifier: &ModuleSpecifier,
     maybe_dependencies: Option<HashMap<String, analysis::Dependency>>,
+    maybe_dependency_ranges: Option<analysis::DependencyRanges>,
   ) -> Result<(), AnyError> {
     if let Some(doc) = self.docs.get_mut(specifier) {
       doc.dependencies = maybe_dependencies;
+      doc.dependency_ranges = maybe_dependency_ranges;
       self.calculate_dependents();
       Ok(())
     } else {
@@ -385,6 +450,35 @@ mod tests {
   use super::*;
   use deno_core::resolve_url;
   use lspower::lsp;
+
+  #[test]
+  fn test_language_id() {
+    assert_eq!(
+      "javascript".parse::<LanguageId>().unwrap(),
+      LanguageId::JavaScript
+    );
+    assert_eq!(
+      "javascriptreact".parse::<LanguageId>().unwrap(),
+      LanguageId::Jsx
+    );
+    assert_eq!("jsx".parse::<LanguageId>().unwrap(), LanguageId::Jsx);
+    assert_eq!(
+      "typescript".parse::<LanguageId>().unwrap(),
+      LanguageId::TypeScript
+    );
+    assert_eq!(
+      "typescriptreact".parse::<LanguageId>().unwrap(),
+      LanguageId::Tsx
+    );
+    assert_eq!("tsx".parse::<LanguageId>().unwrap(), LanguageId::Tsx);
+    assert_eq!("json".parse::<LanguageId>().unwrap(), LanguageId::Json);
+    assert_eq!("jsonc".parse::<LanguageId>().unwrap(), LanguageId::JsonC);
+    assert_eq!(
+      "markdown".parse::<LanguageId>().unwrap(),
+      LanguageId::Markdown
+    );
+    assert_eq!("rust".parse::<LanguageId>().unwrap(), LanguageId::Unknown);
+  }
 
   #[test]
   fn test_document_cache_contains() {
@@ -481,10 +575,18 @@ mod tests {
     document_cache.open(
       specifier.clone(),
       1,
-      LanguageId::TypeScript,
+      "typescript".parse().unwrap(),
       "console.log(\"hello world\");\n",
     );
     assert!(document_cache.is_diagnosable(&specifier));
+    let specifier = resolve_url("file:///a/file.rs").unwrap();
+    document_cache.open(
+      specifier.clone(),
+      1,
+      "rust".parse().unwrap(),
+      "pub mod a;",
+    );
+    assert!(!document_cache.is_diagnosable(&specifier));
     let specifier =
       resolve_url("asset:///lib.es2015.symbol.wellknown.d.ts").unwrap();
     assert!(document_cache.is_diagnosable(&specifier));

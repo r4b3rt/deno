@@ -1,4 +1,3 @@
-use crate::error::bad_resource_id;
 use crate::error::type_error;
 use crate::error::AnyError;
 use crate::include_js_files;
@@ -12,8 +11,9 @@ pub(crate) fn init_builtins() -> Extension {
   Extension::builder()
     .js(include_js_files!(
       prefix "deno:core",
-      "core.js",
-      "error.js",
+      "00_primordials.js",
+      "01_core.js",
+      "02_error.js",
     ))
     .ops(vec![
       ("op_close", op_sync(op_close)),
@@ -46,10 +46,7 @@ pub fn op_close(
 ) -> Result<(), AnyError> {
   // TODO(@AaronO): drop Option after improving type-strictness balance in serde_v8
   let rid = rid.ok_or_else(|| type_error("missing or invalid `rid`"))?;
-  state
-    .resource_table
-    .close(rid)
-    .ok_or_else(bad_resource_id)?;
+  state.resource_table.close(rid)?;
 
   Ok(())
 }
@@ -61,10 +58,10 @@ pub fn op_print(
   is_err: bool,
 ) -> Result<(), AnyError> {
   if is_err {
-    eprint!("{}", msg);
+    stderr().write_all(msg.as_bytes())?;
     stderr().flush().unwrap();
   } else {
-    print!("{}", msg);
+    stdout().write_all(msg.as_bytes())?;
     stdout().flush().unwrap();
   }
   Ok(())

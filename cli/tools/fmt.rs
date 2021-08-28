@@ -28,8 +28,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const BOM_CHAR: char = '\u{FEFF}';
-
 /// Format JavaScript/TypeScript files.
 pub async fn format(
   args: Vec<PathBuf>,
@@ -99,7 +97,7 @@ fn format_markdown(
 ) -> Result<String, String> {
   let md_config = get_markdown_config();
   dprint_plugin_markdown::format_text(
-    &file_text,
+    file_text,
     &md_config,
     move |tag, text, line_width| {
       let tag = tag.to_lowercase();
@@ -125,7 +123,7 @@ fn format_markdown(
         if matches!(extension, "json" | "jsonc") {
           let mut json_config = get_json_config();
           json_config.line_width = line_width;
-          dprint_plugin_json::format_text(&text, &json_config)
+          dprint_plugin_json::format_text(text, &json_config)
         } else {
           let fake_filename =
             PathBuf::from(format!("deno_fmt_stdin.{}", extension));
@@ -133,7 +131,7 @@ fn format_markdown(
           codeblock_config.line_width = line_width;
           dprint_plugin_typescript::format_text(
             &fake_filename,
-            &text,
+            text,
             &codeblock_config,
           )
         }
@@ -150,7 +148,7 @@ fn format_markdown(
 /// See https://git.io/Jt4ht for configuration.
 fn format_json(file_text: &str) -> Result<String, String> {
   let json_config = get_json_config();
-  dprint_plugin_json::format_text(&file_text, &json_config)
+  dprint_plugin_json::format_text(file_text, &json_config)
     .map_err(|e| e.to_string())
 }
 
@@ -162,11 +160,11 @@ pub fn format_file(
 ) -> Result<String, String> {
   let ext = get_extension(file_path).unwrap_or_else(String::new);
   if ext == "md" {
-    format_markdown(&file_text, config)
+    format_markdown(file_text, config)
   } else if matches!(ext.as_str(), "json" | "jsonc") {
-    format_json(&file_text)
+    format_json(file_text)
   } else {
-    dprint_plugin_typescript::format_text(&file_path, &file_text, &config)
+    dprint_plugin_typescript::format_text(file_path, file_text, &config)
       .map_err(|e| e.to_string())
   }
 }
@@ -350,12 +348,11 @@ fn read_file_contents(file_path: &Path) -> Result<FileContents, AnyError> {
   let file_bytes = fs::read(&file_path)?;
   let charset = text_encoding::detect_charset(&file_bytes);
   let file_text = text_encoding::convert_to_utf8(&file_bytes, charset)?;
-  let had_bom = file_text.starts_with(BOM_CHAR);
+  let had_bom = file_text.starts_with(text_encoding::BOM_CHAR);
   let text = if had_bom {
-    // remove the BOM
-    String::from(&file_text[BOM_CHAR.len_utf8()..])
+    text_encoding::strip_bom(&file_text).to_string()
   } else {
-    String::from(file_text)
+    file_text.to_string()
   };
 
   Ok(FileContents { text, had_bom })
@@ -367,7 +364,7 @@ fn write_file_contents(
 ) -> Result<(), AnyError> {
   let file_text = if file_contents.had_bom {
     // add back the BOM
-    format!("{}{}", BOM_CHAR, file_contents.text)
+    format!("{}{}", text_encoding::BOM_CHAR, file_contents.text)
   } else {
     file_contents.text
   };
