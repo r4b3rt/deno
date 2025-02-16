@@ -1,10 +1,17 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use super::analysis;
-use super::language_server;
-use super::tsc;
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::Arc;
 
-use deno_core::error::anyhow;
+use deno_ast::swc::ast;
+use deno_ast::swc::visit::Visit;
+use deno_ast::swc::visit::VisitWith;
+use deno_ast::ParsedSource;
+use deno_ast::SourceRange;
+use deno_ast::SourceRangedForSpanned;
+use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
 use deno_core::resolve_url;
 use deno_core::serde::Deserialize;
@@ -12,22 +19,22 @@ use deno_core::serde::Serialize;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
 use deno_core::ModuleSpecifier;
-use lspower::lsp;
+use lazy_regex::lazy_regex;
+use once_cell::sync::Lazy;
 use regex::Regex;
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::rc::Rc;
-use swc_common::SourceMap;
-use swc_common::Span;
-use swc_ecmascript::ast;
-use swc_ecmascript::visit::Node;
-use swc_ecmascript::visit::Visit;
-use swc_ecmascript::visit::VisitWith;
+use tokio_util::sync::CancellationToken;
+use tower_lsp::lsp_types as lsp;
 
-lazy_static::lazy_static! {
-  static ref ABSTRACT_MODIFIER: Regex = Regex::new(r"\babstract\b").unwrap();
-  static ref EXPORT_MODIFIER: Regex = Regex::new(r"\bexport\b").unwrap();
-}
+use super::analysis::source_range_to_lsp_range;
+use super::config::CodeLensSettings;
+use super::language_server;
+use super::text::LineIndex;
+use super::tsc;
+use super::tsc::NavigationTree;
+
+static ABSTRACT_MODIFIER: Lazy<Regex> = lazy_regex!(r"\babstract\b");
+
+static EXPORT_MODIFIER: Lazy<Regex> = lazy_regex!(r"\bexport\b");
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CodeLensSource {
@@ -44,65 +51,76 @@ pub struct CodeLensData {
   pub specifier: ModuleSpecifier,
 }
 
-fn span_to_range(span: &Span, source_map: Rc<SourceMap>) -> lsp::Range {
-  let start = source_map.lookup_char_pos(span.lo);
-  let end = source_map.lookup_char_pos(span.hi);
-  lsp::Range {
-    start: lsp::Position {
-      line: (start.line - 1) as u32,
-      character: start.col_display as u32,
-    },
-    end: lsp::Position {
-      line: (end.line - 1) as u32,
-      character: end.col_display as u32,
-    },
-  }
-}
-
 struct DenoTestCollector {
   code_lenses: Vec<lsp::CodeLens>,
-  source_map: Rc<SourceMap>,
+  parsed_source: ParsedSource,
   specifier: ModuleSpecifier,
   test_vars: HashSet<String>,
 }
 
 impl DenoTestCollector {
-  pub fn new(specifier: ModuleSpecifier, source_map: Rc<SourceMap>) -> Self {
+  pub fn new(specifier: ModuleSpecifier, parsed_source: ParsedSource) -> Self {
     Self {
       code_lenses: Vec::new(),
-      source_map,
+      parsed_source,
       specifier,
       test_vars: HashSet::new(),
     }
   }
 
-  fn add_code_lens<N: AsRef<str>>(&mut self, name: N, span: &Span) {
-    let range = span_to_range(span, self.source_map.clone());
+  fn add_code_lenses<N: AsRef<str>>(&mut self, name: N, range: &SourceRange) {
+    let range =
+      source_range_to_lsp_range(range, self.parsed_source.text_info_lazy());
+    self.add_code_lens(&name, range, "▶\u{fe0e} Run Test", false);
+    self.add_code_lens(&name, range, "Debug", true);
+  }
+
+  fn add_code_lens<N: AsRef<str>>(
+    &mut self,
+    name: &N,
+    range: lsp::Range,
+    title: &str,
+    inspect: bool,
+  ) {
+    let options = json!({
+      "inspect": inspect,
+    });
     self.code_lenses.push(lsp::CodeLens {
       range,
       command: Some(lsp::Command {
-        title: "▶\u{fe0e} Run Test".to_string(),
-        command: "deno.test".to_string(),
-        arguments: Some(vec![json!(self.specifier), json!(name.as_ref())]),
+        title: title.to_string(),
+        command: "deno.client.test".to_string(),
+        arguments: Some(vec![
+          json!(self.specifier),
+          json!(name.as_ref()),
+          options,
+        ]),
       }),
       data: None,
     });
   }
 
-  fn check_call_expr(&mut self, node: &ast::CallExpr, span: &Span) {
-    if let Some(expr) = node.args.get(0).map(|es| es.expr.as_ref()) {
+  fn check_call_expr(&mut self, node: &ast::CallExpr, range: &SourceRange) {
+    if let Some(expr) = node.args.first().map(|es| es.expr.as_ref()) {
       match expr {
         ast::Expr::Object(obj_lit) => {
           for prop in &obj_lit.props {
             if let ast::PropOrSpread::Prop(prop) = prop {
               if let ast::Prop::KeyValue(key_value_prop) = prop.as_ref() {
-                if let ast::PropName::Ident(ident) = &key_value_prop.key {
-                  if ident.sym.to_string() == "name" {
-                    if let ast::Expr::Lit(ast::Lit::Str(lit_str)) =
-                      key_value_prop.value.as_ref()
-                    {
-                      let name = lit_str.value.to_string();
-                      self.add_code_lens(name, &span);
+                if let ast::PropName::Ident(ast::IdentName { sym, .. }) =
+                  &key_value_prop.key
+                {
+                  if sym == "name" {
+                    match key_value_prop.value.as_ref() {
+                      ast::Expr::Lit(ast::Lit::Str(lit_str)) => {
+                        let name = lit_str.value.to_string();
+                        self.add_code_lenses(name, range);
+                      }
+                      ast::Expr::Tpl(tpl) if tpl.quasis.len() == 1 => {
+                        let name = tpl.quasis.first().unwrap().raw.to_string();
+                        self.add_code_lenses(name, range);
+                      }
+                      _ => {}
                     }
                   }
                 }
@@ -110,9 +128,19 @@ impl DenoTestCollector {
             }
           }
         }
+        ast::Expr::Fn(fn_expr) => {
+          if let Some(ast::Ident { sym, .. }) = fn_expr.ident.as_ref() {
+            let name = sym.to_string();
+            self.add_code_lenses(name, range);
+          }
+        }
         ast::Expr::Lit(ast::Lit::Str(lit_str)) => {
           let name = lit_str.value.to_string();
-          self.add_code_lens(name, &span);
+          self.add_code_lenses(name, range);
+        }
+        ast::Expr::Tpl(tpl) if tpl.quasis.len() == 1 => {
+          let name = tpl.quasis.first().unwrap().raw.to_string();
+          self.add_code_lenses(name, range);
         }
         _ => (),
       }
@@ -126,22 +154,35 @@ impl DenoTestCollector {
 }
 
 impl Visit for DenoTestCollector {
-  fn visit_call_expr(&mut self, node: &ast::CallExpr, _parent: &dyn Node) {
-    if let ast::ExprOrSuper::Expr(callee_expr) = &node.callee {
+  fn visit_call_expr(&mut self, node: &ast::CallExpr) {
+    if let ast::Callee::Expr(callee_expr) = &node.callee {
       match callee_expr.as_ref() {
         ast::Expr::Ident(ident) => {
           if self.test_vars.contains(&ident.sym.to_string()) {
-            self.check_call_expr(node, &ident.span);
+            self.check_call_expr(node, &ident.range());
           }
         }
         ast::Expr::Member(member_expr) => {
-          if let ast::Expr::Ident(ns_prop_ident) = member_expr.prop.as_ref() {
-            if ns_prop_ident.sym.to_string() == "test" {
-              if let ast::ExprOrSuper::Expr(obj_expr) = &member_expr.obj {
-                if let ast::Expr::Ident(ident) = obj_expr.as_ref() {
-                  if ident.sym.to_string() == "Deno" {
-                    self.check_call_expr(node, &ns_prop_ident.span);
-                  }
+          if let ast::MemberProp::Ident(ns_prop_ident) = &member_expr.prop {
+            let mut member_expr = member_expr;
+            let mut ns_prop_ident = ns_prop_ident;
+            let range = ns_prop_ident.range();
+            if matches!(ns_prop_ident.sym.as_str(), "ignore" | "only") {
+              let ast::Expr::Member(member_expr_) = member_expr.obj.as_ref()
+              else {
+                return;
+              };
+              member_expr = member_expr_;
+              let ast::MemberProp::Ident(ns_prop_ident_) = &member_expr.prop
+              else {
+                return;
+              };
+              ns_prop_ident = ns_prop_ident_;
+            }
+            if ns_prop_ident.sym == "test" {
+              if let ast::Expr::Ident(ident) = member_expr.obj.as_ref() {
+                if ident.sym == "Deno" {
+                  self.check_call_expr(node, &range);
                 }
               }
             }
@@ -152,13 +193,13 @@ impl Visit for DenoTestCollector {
     }
   }
 
-  fn visit_var_decl(&mut self, node: &ast::VarDecl, _parent: &dyn Node) {
+  fn visit_var_decl(&mut self, node: &ast::VarDecl) {
     for decl in &node.decls {
       if let Some(init) = &decl.init {
         match init.as_ref() {
           // Identify destructured assignments of `test` from `Deno`
           ast::Expr::Ident(ident) => {
-            if ident.sym.to_string() == "Deno" {
+            if ident.sym == "Deno" {
               if let ast::Pat::Object(object_pat) = &decl.name {
                 for prop in &object_pat.props {
                   match prop {
@@ -170,7 +211,7 @@ impl Visit for DenoTestCollector {
                     }
                     ast::ObjectPatProp::KeyValue(prop) => {
                       if let ast::PropName::Ident(key_ident) = &prop.key {
-                        if key_ident.sym.to_string() == "test" {
+                        if key_ident.sym == "test" {
                           if let ast::Pat::Ident(value_ident) =
                             &prop.value.as_ref()
                           {
@@ -189,16 +230,12 @@ impl Visit for DenoTestCollector {
           }
           // Identify variable assignments where the init is `Deno.test`
           ast::Expr::Member(member_expr) => {
-            if let ast::ExprOrSuper::Expr(expr) = &member_expr.obj {
-              if let ast::Expr::Ident(obj_ident) = expr.as_ref() {
-                if obj_ident.sym.to_string() == "Deno" {
-                  if let ast::Expr::Ident(prop_ident) =
-                    &member_expr.prop.as_ref()
-                  {
-                    if prop_ident.sym.to_string() == "test" {
-                      if let ast::Pat::Ident(binding_ident) = &decl.name {
-                        self.test_vars.insert(binding_ident.id.sym.to_string());
-                      }
+            if let ast::Expr::Ident(obj_ident) = member_expr.obj.as_ref() {
+              if obj_ident.sym == "Deno" {
+                if let ast::MemberProp::Ident(prop_ident) = &member_expr.prop {
+                  if prop_ident.sym == "test" {
+                    if let ast::Pat::Ident(binding_ident) = &decl.name {
+                      self.test_vars.insert(binding_ident.id.sym.to_string());
                     }
                   }
                 }
@@ -215,25 +252,40 @@ impl Visit for DenoTestCollector {
 async fn resolve_implementation_code_lens(
   code_lens: lsp::CodeLens,
   data: CodeLensData,
-  language_server: &mut language_server::Inner,
+  language_server: &language_server::Inner,
+  token: &CancellationToken,
 ) -> Result<lsp::CodeLens, AnyError> {
-  let line_index = language_server
-    .get_line_index_sync(&data.specifier)
-    .unwrap();
-  let req = tsc::RequestMethod::GetImplementation((
-    data.specifier.clone(),
-    line_index.offset_tsc(code_lens.range.start)?,
-  ));
-  let snapshot = language_server.snapshot()?;
-  let maybe_implementations: Option<Vec<tsc::ImplementationLocation>> =
-    language_server.ts_server.request(snapshot, req).await?;
+  let asset_or_doc = language_server.get_asset_or_document(&data.specifier)?;
+  let line_index = asset_or_doc.line_index();
+  let maybe_implementations = language_server
+    .ts_server
+    .get_implementations(
+      language_server.snapshot(),
+      data.specifier.clone(),
+      line_index.offset_tsc(code_lens.range.start)?,
+      token,
+    )
+    .await
+    .map_err(|err| {
+      if token.is_cancelled() {
+        anyhow!("request cancelled")
+      } else {
+        anyhow!(
+          "Unable to get implementation locations from TypeScript: {:#}",
+          err
+        )
+      }
+    })?;
   if let Some(implementations) = maybe_implementations {
     let mut locations = Vec::new();
     for implementation in implementations {
+      if token.is_cancelled() {
+        break;
+      }
       let implementation_specifier =
         resolve_url(&implementation.document_span.file_name)?;
       let implementation_location =
-        implementation.to_location(&line_index, language_server);
+        implementation.to_location(line_index.clone(), language_server);
       if !(implementation_specifier == data.specifier
         && implementation_location.range.start == code_lens.range.start)
       {
@@ -248,7 +300,7 @@ async fn resolve_implementation_code_lens(
       };
       lsp::Command {
         title,
-        command: "deno.showReferences".to_string(),
+        command: "deno.client.showReferences".to_string(),
         arguments: Some(vec![
           json!(data.specifier),
           json!(code_lens.range.start),
@@ -284,150 +336,143 @@ async fn resolve_implementation_code_lens(
 async fn resolve_references_code_lens(
   code_lens: lsp::CodeLens,
   data: CodeLensData,
-  language_server: &mut language_server::Inner,
+  language_server: &language_server::Inner,
+  token: &CancellationToken,
 ) -> Result<lsp::CodeLens, AnyError> {
-  let line_index = language_server
-    .get_line_index_sync(&data.specifier)
-    .unwrap();
-  let req = tsc::RequestMethod::GetReferences((
-    data.specifier.clone(),
-    line_index.offset_tsc(code_lens.range.start)?,
-  ));
-  let snapshot = language_server.snapshot()?;
-  let maybe_references: Option<Vec<tsc::ReferenceEntry>> =
-    language_server.ts_server.request(snapshot, req).await?;
-  if let Some(references) = maybe_references {
+  fn get_locations(
+    maybe_referenced_symbols: Option<Vec<tsc::ReferencedSymbol>>,
+    language_server: &language_server::Inner,
+    token: &CancellationToken,
+  ) -> Result<Vec<lsp::Location>, AnyError> {
+    let symbols = match maybe_referenced_symbols {
+      Some(symbols) => symbols,
+      None => return Ok(Vec::new()),
+    };
     let mut locations = Vec::new();
-    for reference in references {
+    for reference in symbols.iter().flat_map(|s| &s.references) {
+      if token.is_cancelled() {
+        break;
+      }
       if reference.is_definition {
         continue;
       }
       let reference_specifier =
-        resolve_url(&reference.document_span.file_name)?;
-      let line_index =
-        language_server.get_line_index(reference_specifier).await?;
-      locations.push(reference.to_location(&line_index, language_server));
+        resolve_url(&reference.entry.document_span.file_name)?;
+      let asset_or_doc =
+        language_server.get_asset_or_document(&reference_specifier)?;
+      locations.push(
+        reference
+          .entry
+          .to_location(asset_or_doc.line_index(), language_server),
+      );
     }
-    let command = if !locations.is_empty() {
-      let title = if locations.len() > 1 {
-        format!("{} references", locations.len())
-      } else {
-        "1 reference".to_string()
-      };
-      lsp::Command {
-        title,
-        command: "deno.showReferences".to_string(),
-        arguments: Some(vec![
-          json!(data.specifier),
-          json!(code_lens.range.start),
-          json!(locations),
-        ]),
-      }
-    } else {
-      lsp::Command {
-        title: "0 references".to_string(),
-        command: "".to_string(),
-        arguments: None,
-      }
-    };
-    Ok(lsp::CodeLens {
-      range: code_lens.range,
-      command: Some(command),
-      data: None,
-    })
-  } else {
-    let command = lsp::Command {
-      title: "0 references".to_string(),
-      command: "".to_string(),
-      arguments: None,
-    };
-    Ok(lsp::CodeLens {
-      range: code_lens.range,
-      command: Some(command),
-      data: None,
-    })
+    Ok(locations)
   }
+
+  let asset_or_document =
+    language_server.get_asset_or_document(&data.specifier)?;
+  let line_index = asset_or_document.line_index();
+
+  let maybe_referenced_symbols = language_server
+    .ts_server
+    .find_references(
+      language_server.snapshot(),
+      data.specifier.clone(),
+      line_index.offset_tsc(code_lens.range.start)?,
+      token,
+    )
+    .await
+    .map_err(|err| {
+      if token.is_cancelled() {
+        anyhow!("request cancelled")
+      } else {
+        anyhow!("Unable to get references from TypeScript: {:#}", err)
+      }
+    })?;
+  let locations =
+    get_locations(maybe_referenced_symbols, language_server, token)?;
+  let title = if locations.len() == 1 {
+    "1 reference".to_string()
+  } else {
+    format!("{} references", locations.len())
+  };
+  let command = if locations.is_empty() {
+    lsp::Command {
+      title,
+      command: String::new(),
+      arguments: None,
+    }
+  } else {
+    lsp::Command {
+      title,
+      command: "deno.client.showReferences".to_string(),
+      arguments: Some(vec![
+        json!(data.specifier),
+        json!(code_lens.range.start),
+        json!(locations),
+      ]),
+    }
+  };
+  Ok(lsp::CodeLens {
+    range: code_lens.range,
+    command: Some(command),
+    data: None,
+  })
 }
 
-pub(crate) async fn resolve_code_lens(
+pub async fn resolve_code_lens(
   code_lens: lsp::CodeLens,
-  language_server: &mut language_server::Inner,
+  language_server: &language_server::Inner,
+  token: &CancellationToken,
 ) -> Result<lsp::CodeLens, AnyError> {
   let data: CodeLensData =
     serde_json::from_value(code_lens.data.clone().unwrap())?;
   match data.source {
     CodeLensSource::Implementations => {
-      resolve_implementation_code_lens(code_lens, data, language_server).await
+      resolve_implementation_code_lens(code_lens, data, language_server, token)
+        .await
     }
     CodeLensSource::References => {
-      resolve_references_code_lens(code_lens, data, language_server).await
+      resolve_references_code_lens(code_lens, data, language_server, token)
+        .await
     }
   }
 }
 
-pub(crate) async fn collect(
+pub fn collect_test(
   specifier: &ModuleSpecifier,
-  language_server: &mut language_server::Inner,
+  parsed_source: &ParsedSource,
+  _token: &CancellationToken,
 ) -> Result<Vec<lsp::CodeLens>, AnyError> {
-  let mut code_lenses = collect_test(specifier, language_server)?;
-  code_lenses.extend(collect_tsc(specifier, language_server).await?);
-
-  Ok(code_lenses)
-}
-
-fn collect_test(
-  specifier: &ModuleSpecifier,
-  language_server: &mut language_server::Inner,
-) -> Result<Vec<lsp::CodeLens>, AnyError> {
-  if language_server.config.specifier_code_lens_test(specifier) {
-    let source = language_server
-      .get_text_content(specifier)
-      .ok_or_else(|| anyhow!("Missing text content: {}", specifier))?;
-    let media_type = language_server
-      .get_media_type(specifier)
-      .ok_or_else(|| anyhow!("Missing media type: {}", specifier))?;
-    // we swallow parsed errors, as they are meaningless here.
-    // TODO(@kitsonk) consider caching previous code_lens results to return if
-    // there is a parse error to avoid issues of lenses popping in and out
-    if let Ok(parsed_module) =
-      analysis::parse_module(specifier, &source, &media_type)
-    {
-      let mut collector = DenoTestCollector::new(
-        specifier.clone(),
-        parsed_module.source_map.clone(),
-      );
-      parsed_module.module.visit_with(
-        &ast::Invalid {
-          span: swc_common::DUMMY_SP,
-        },
-        &mut collector,
-      );
-      return Ok(collector.take());
-    }
-  }
-  Ok(Vec::new())
+  // TODO(nayeemrmn): Do cancellation checks while collecting tests.
+  let mut collector =
+    DenoTestCollector::new(specifier.clone(), parsed_source.clone());
+  parsed_source.program().visit_with(&mut collector);
+  Ok(collector.take())
 }
 
 /// Return tsc navigation tree code lenses.
-async fn collect_tsc(
+pub fn collect_tsc(
   specifier: &ModuleSpecifier,
-  language_server: &mut language_server::Inner,
+  code_lens_settings: &CodeLensSettings,
+  line_index: Arc<LineIndex>,
+  navigation_tree: &NavigationTree,
+  token: &CancellationToken,
 ) -> Result<Vec<lsp::CodeLens>, AnyError> {
-  let workspace_settings = language_server.config.get_workspace_settings();
-  let line_index = language_server
-    .get_line_index_sync(&specifier)
-    .ok_or_else(|| anyhow!("Missing line index."))?;
-  let navigation_tree = language_server.get_navigation_tree(specifier).await?;
   let code_lenses = Rc::new(RefCell::new(Vec::new()));
-  navigation_tree.walk(&|i, mp| {
+  navigation_tree.walk(token, &|i, mp| {
     let mut code_lenses = code_lenses.borrow_mut();
 
     // TSC Implementations Code Lens
-    if workspace_settings.code_lens.implementations {
+    if code_lens_settings.implementations {
       let source = CodeLensSource::Implementations;
       match i.kind {
         tsc::ScriptElementKind::InterfaceElement => {
-          code_lenses.push(i.to_code_lens(&line_index, specifier, &source));
+          code_lenses.push(i.to_code_lens(
+            line_index.clone(),
+            specifier,
+            &source,
+          ));
         }
         tsc::ScriptElementKind::ClassElement
         | tsc::ScriptElementKind::MemberFunctionElement
@@ -435,7 +480,11 @@ async fn collect_tsc(
         | tsc::ScriptElementKind::MemberGetAccessorElement
         | tsc::ScriptElementKind::MemberSetAccessorElement => {
           if ABSTRACT_MODIFIER.is_match(&i.kind_modifiers) {
-            code_lenses.push(i.to_code_lens(&line_index, &specifier, &source));
+            code_lenses.push(i.to_code_lens(
+              line_index.clone(),
+              specifier,
+              &source,
+            ));
           }
         }
         _ => (),
@@ -443,37 +492,58 @@ async fn collect_tsc(
     }
 
     // TSC References Code Lens
-    if workspace_settings.code_lens.references {
+    if code_lens_settings.references {
       let source = CodeLensSource::References;
       if let Some(parent) = &mp {
         if parent.kind == tsc::ScriptElementKind::EnumElement {
-          code_lenses.push(i.to_code_lens(&line_index, &specifier, &source));
+          code_lenses.push(i.to_code_lens(
+            line_index.clone(),
+            specifier,
+            &source,
+          ));
         }
       }
       match i.kind {
         tsc::ScriptElementKind::FunctionElement => {
-          if workspace_settings.code_lens.references_all_functions {
-            code_lenses.push(i.to_code_lens(&line_index, &specifier, &source));
+          if code_lens_settings.references_all_functions {
+            code_lenses.push(i.to_code_lens(
+              line_index.clone(),
+              specifier,
+              &source,
+            ));
           }
         }
         tsc::ScriptElementKind::ConstElement
         | tsc::ScriptElementKind::LetElement
         | tsc::ScriptElementKind::VariableElement => {
           if EXPORT_MODIFIER.is_match(&i.kind_modifiers) {
-            code_lenses.push(i.to_code_lens(&line_index, &specifier, &source));
+            code_lenses.push(i.to_code_lens(
+              line_index.clone(),
+              specifier,
+              &source,
+            ));
           }
         }
         tsc::ScriptElementKind::ClassElement => {
           if i.text != "<class>" {
-            code_lenses.push(i.to_code_lens(&line_index, &specifier, &source));
+            code_lenses.push(i.to_code_lens(
+              line_index.clone(),
+              specifier,
+              &source,
+            ));
           }
         }
         tsc::ScriptElementKind::InterfaceElement
         | tsc::ScriptElementKind::TypeElement
         | tsc::ScriptElementKind::EnumElement => {
-          code_lenses.push(i.to_code_lens(&line_index, &specifier, &source));
+          code_lenses.push(i.to_code_lens(
+            line_index.clone(),
+            specifier,
+            &source,
+          ));
         }
         tsc::ScriptElementKind::LocalFunctionElement
+        | tsc::ScriptElementKind::MemberFunctionElement
         | tsc::ScriptElementKind::MemberGetAccessorElement
         | tsc::ScriptElementKind::MemberSetAccessorElement
         | tsc::ScriptElementKind::ConstructorImplementationElement
@@ -485,8 +555,8 @@ async fn collect_tsc(
                 | tsc::ScriptElementKind::InterfaceElement
                 | tsc::ScriptElementKind::TypeElement => {
                   code_lenses.push(i.to_code_lens(
-                    &line_index,
-                    &specifier,
+                    line_index.clone(),
+                    specifier,
                     &source,
                   ));
                 }
@@ -498,14 +568,15 @@ async fn collect_tsc(
         _ => (),
       }
     }
-  });
+  })?;
   Ok(Rc::try_unwrap(code_lenses).unwrap().into_inner())
 }
 
 #[cfg(test)]
 mod tests {
+  use deno_ast::MediaType;
+
   use super::*;
-  use crate::media_type::MediaType;
 
   #[test]
   fn test_deno_test_collector() {
@@ -516,19 +587,28 @@ mod tests {
         fn() {}
       });
 
+      Deno.test(function useFnName() {});
+
       Deno.test("test b", function anotherTest() {});
+
+      Deno.test.ignore("test ignore", () => {});
+
+      Deno.test.only("test only", () => {});
+
+      Deno.test(`test template literal name`, () => {});
     "#;
-    let parsed_module =
-      analysis::parse_module(&specifier, source, &MediaType::TypeScript)
-        .unwrap();
+    let parsed_module = deno_ast::parse_module(deno_ast::ParseParams {
+      specifier: specifier.clone(),
+      text: source.into(),
+      media_type: MediaType::TypeScript,
+      capture_tokens: true,
+      scope_analysis: true,
+      maybe_syntax: None,
+    })
+    .unwrap();
     let mut collector =
-      DenoTestCollector::new(specifier, parsed_module.source_map.clone());
-    parsed_module.module.visit_with(
-      &ast::Invalid {
-        span: swc_common::DUMMY_SP,
-      },
-      &mut collector,
-    );
+      DenoTestCollector::new(specifier, parsed_module.clone());
+    parsed_module.program().visit_with(&mut collector);
     assert_eq!(
       collector.take(),
       vec![
@@ -545,10 +625,37 @@ mod tests {
           },
           command: Some(lsp::Command {
             title: "▶\u{fe0e} Run Test".to_string(),
-            command: "deno.test".to_string(),
+            command: "deno.client.test".to_string(),
             arguments: Some(vec![
               json!("https://deno.land/x/mod.ts"),
               json!("test a"),
+              json!({
+                "inspect": false,
+              }),
+            ])
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 1,
+              character: 11
+            },
+            end: lsp::Position {
+              line: 1,
+              character: 15
+            }
+          },
+          command: Some(lsp::Command {
+            title: "Debug".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test a"),
+              json!({
+                "inspect": true,
+              }),
             ])
           }),
           data: None,
@@ -566,14 +673,233 @@ mod tests {
           },
           command: Some(lsp::Command {
             title: "▶\u{fe0e} Run Test".to_string(),
-            command: "deno.test".to_string(),
+            command: "deno.client.test".to_string(),
             arguments: Some(vec![
               json!("https://deno.land/x/mod.ts"),
-              json!("test b"),
+              json!("useFnName"),
+              json!({
+                "inspect": false,
+              }),
             ])
           }),
           data: None,
-        }
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 6,
+              character: 11
+            },
+            end: lsp::Position {
+              line: 6,
+              character: 15
+            }
+          },
+          command: Some(lsp::Command {
+            title: "Debug".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("useFnName"),
+              json!({
+                "inspect": true,
+              }),
+            ])
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 8,
+              character: 11
+            },
+            end: lsp::Position {
+              line: 8,
+              character: 15
+            }
+          },
+          command: Some(lsp::Command {
+            title: "▶\u{fe0e} Run Test".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test b"),
+              json!({
+                "inspect": false,
+              }),
+            ])
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 8,
+              character: 11
+            },
+            end: lsp::Position {
+              line: 8,
+              character: 15
+            }
+          },
+          command: Some(lsp::Command {
+            title: "Debug".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test b"),
+              json!({
+                "inspect": true,
+              }),
+            ])
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 10,
+              character: 16,
+            },
+            end: lsp::Position {
+              line: 10,
+              character: 22,
+            },
+          },
+          command: Some(lsp::Command {
+            title: "▶\u{fe0e} Run Test".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test ignore"),
+              json!({
+                "inspect": false,
+              }),
+            ]),
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 10,
+              character: 16,
+            },
+            end: lsp::Position {
+              line: 10,
+              character: 22,
+            },
+          },
+          command: Some(lsp::Command {
+            title: "Debug".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test ignore"),
+              json!({
+                "inspect": true,
+              }),
+            ]),
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 12,
+              character: 16,
+            },
+            end: lsp::Position {
+              line: 12,
+              character: 20,
+            },
+          },
+          command: Some(lsp::Command {
+            title: "▶\u{fe0e} Run Test".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test only"),
+              json!({
+                "inspect": false,
+              }),
+            ]),
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 12,
+              character: 16,
+            },
+            end: lsp::Position {
+              line: 12,
+              character: 20,
+            },
+          },
+          command: Some(lsp::Command {
+            title: "Debug".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test only"),
+              json!({
+                "inspect": true,
+              }),
+            ]),
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 14,
+              character: 11,
+            },
+            end: lsp::Position {
+              line: 14,
+              character: 15,
+            },
+          },
+          command: Some(lsp::Command {
+            title: "▶\u{fe0e} Run Test".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test template literal name"),
+              json!({
+                "inspect": false,
+              }),
+            ]),
+          }),
+          data: None,
+        },
+        lsp::CodeLens {
+          range: lsp::Range {
+            start: lsp::Position {
+              line: 14,
+              character: 11,
+            },
+            end: lsp::Position {
+              line: 14,
+              character: 15,
+            },
+          },
+          command: Some(lsp::Command {
+            title: "Debug".to_string(),
+            command: "deno.client.test".to_string(),
+            arguments: Some(vec![
+              json!("https://deno.land/x/mod.ts"),
+              json!("test template literal name"),
+              json!({
+                "inspect": true,
+              }),
+            ]),
+          }),
+          data: None,
+        },
       ]
     );
   }

@@ -1,7 +1,6 @@
-// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-pub mod errors;
-pub mod runtime_compiler;
+pub mod bench;
+pub mod jupyter;
+pub mod lint;
 pub mod testing;
-
-pub use deno_runtime::ops::{reg_async, reg_sync};
